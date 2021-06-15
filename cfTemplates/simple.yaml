@@ -29,8 +29,3 @@ Resources:
           - Id: Expiration
             ExpirationInDays: 1
             Status: Enabled
-
-
-
-
-

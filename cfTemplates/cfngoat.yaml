@@ -387,10 +387,3 @@ Outputs:
   SecretKey: 
     Description: The Secret Key of the IAM User
     Value: !GetAtt AccessKey.SecretAccessKey
-
-
-
-
-
-
-

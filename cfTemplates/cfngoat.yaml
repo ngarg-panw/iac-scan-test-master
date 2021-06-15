@@ -1,0 +1,389 @@
+AWSTemplateFormatVersion: '2010-09-09' 
+Description: AWS CloudFormation Template to deploy insecure infrastructure
+Parameters:
+  CompanyName:
+    Description: Company Name
+    Type: String
+    Default: acme
+  Environment: 
+    Description: Environment
+    Type: String
+    Default: dev
+  LatestAmiId:
+    Type: AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>
+    Default: /aws/service/ami-amazon-linux-latest/amzn2-ami-hvm-x86_64-gp2
+
+Resources:
+  ####################
+  ###  EC2 in VPC  ###
+  ####################
+  EC2Instance:
+    Type: AWS::EC2::Instance
+    Properties:
+      AvailabilityZone: 
+        Fn::Select:
+        - 0
+        - Fn::GetAZs: ""
+      InstanceType: t2.nano
+      SecurityGroupIds: 
+        - !Ref WebNodeSG
+      ImageId: !Ref LatestAmiId
+      SubnetId: !Ref WebSubnet
+      Tags: 
+        - Key: Name
+          Value: !Sub "${AWS::AccountId}-${CompanyName}-${Environment}-ec2" 
+      # Access keys exposed in user data
+      UserData: 
+        Fn::Base64: |
+          #!/bin/bash
+          sudo yum -y update
+          sudo yum -y install httpd php php-mysqlnd
+          sudo systemctl enable httpd
+          sudo systemctl start httpd
+          export AWS_ACCESS_KEY_ID=AKIAIOSFODNN7EXAMAAA
+          export AWS_SECRET_ACCESS_KEY=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
+          export AWS_DEFAULT_REGION=us-west-2
+          echo "<h1>Deployed via CloudFormation</h1>" | sudo tee /var/www/html/index.html
+    
+  WebHostStorage:
+    # Unencrypted Volume 
+    Type: AWS::EC2::Volume
+    Properties: 
+      AvailabilityZone: !Select 
+        - 0
+        - Fn::GetAZs: ""
+      #Encrypted: False
+      Size: 1
+      Tags: 
+        - Key: Name
+          Value: !Sub "${AWS::AccountId}-${CompanyName}-${Environment}-ebs"
+
+  EBSAttachment:
+    Type: AWS::EC2::VolumeAttachment
+    Properties:
+      InstanceId: !Ref EC2Instance
+      VolumeId: !Ref WebHostStorage
+      Device: /dev/sdh
+  
+  # Security Group SSH port open to the world 
+  WebNodeSG:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupName: !Sub "${AWS::AccountId}-${CompanyName}-${Environment}-sg"
+      GroupDescription: !Sub "${AWS::AccountId}-${CompanyName}-${Environment} Security Group"
+      VpcId: !Ref WebVPC
+      SecurityGroupIngress:
+      - IpProtocol: tcp
+        FromPort: 80
+        ToPort: 80
+        CidrIp: 0.0.0.0/0
+      # AWS security group allows all ingress traffic from blocked port (22)
+      - IpProtocol: tcp
+        FromPort: 22
+        ToPort: 22
+        CidrIp: 0.0.0.0/0
+      - IpProtocol: -1
+        FromPort: 0
+        ToPort: 0
+        CidrIp: 0.0.0.0/0
+
+  WebVPC:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: 172.16.0.0/16
+      EnableDnsSupport: True
+      EnableDnsHostnames: True
+      Tags:
+        - Key: Name
+          Value: !Sub "${AWS::AccountId}-${CompanyName}-${Environment}-vpc"
+
+  WebSubnet: 
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref WebVPC
+      CidrBlock: 172.16.10.0/24
+      AvailabilityZone: !Select
+        - 0
+        - Fn::GetAZs: ""
+      # AWS VPC subnets should not allow automatic public IP assignment  
+      MapPublicIpOnLaunch: True
+      Tags:
+        - Key: Name
+          Value: !Sub "${AWS::AccountId}-${CompanyName}-${Environment}-subnet"
+
+  WebSubnet2:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref WebVPC
+      CidrBlock: 172.16.11.0/24
+      AvailabilityZone: !Select
+        - 1
+        - Fn::GetAZs: ""
+      # AWS VPC subnets should not allow automatic public IP assignment  
+      MapPublicIpOnLaunch: True
+      Tags:
+        - Key: Name
+          Value: !Sub "${AWS::AccountId}-${CompanyName}-${Environment}-subnet2"
+
+  WebIGW:
+    Type: AWS::EC2::InternetGateway
+    Properties:
+      Tags:
+        - Key: Name
+          Value: !Sub "${AWS::AccountId}-${CompanyName}-${Environment}-igw"
+
+  InternetGatewayAttachment:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties:
+      InternetGatewayId: !Ref WebIGW
+      VpcId: !Ref WebVPC
+
+  WebRTB:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref WebVPC
+      Tags:
+        - Key: Name
+          Value: !Sub "${AWS::AccountId}-${CompanyName}-${Environment}-rtb"
+
+  WebDefaultPublicRoute:
+    Type: AWS::EC2::Route
+    DependsOn: InternetGatewayAttachment
+    Properties:
+      RouteTableId: !Ref WebRTB
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId: !Ref WebIGW
+
+  RTBAssoc:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref WebSubnet
+      RouteTableId: !Ref WebRTB
+
+  RTBAssoc2:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref WebSubnet2
+      RouteTableId: !Ref WebRTB
+
+  WebENI:
+    Type: AWS::EC2::NetworkInterface
+    Properties:
+      Description: A nice description.
+      SubnetId: !Ref WebSubnet
+      PrivateIpAddress: 172.16.10.100
+      Tags:
+        - Key: Name
+          Value: !Sub "${AWS::AccountId}-${CompanyName}-${Environment}-primary_network_interface"
+
+  VpcFlowLogs:
+    Type: AWS::EC2::FlowLog
+    Properties:
+      ResourceId: !Ref WebVPC
+      ResourceType: VPC
+      LogDestination: !GetAtt FlowBucket.Arn
+      LogDestinationType: s3
+      TrafficType: ALL
+
+  FlowBucket: 
+    # not encrypted, no access logs, no versioning
+    Type: AWS::S3::Bucket
+    DeletionPolicy: Delete
+    Properties:
+      BucketName: !Sub "${AWS::AccountId}-${CompanyName}-${Environment}-flowlogs"
+      Tags:
+        - Key: Name
+          Value: !Sub "${AWS::AccountId}-${CompanyName}-${Environment}-flowlogs"
+  
+  #############
+  ###  IAM  ###
+  #############
+
+  User: 
+    Type: AWS::IAM::User
+    Properties:
+      UserName: !Sub "${AWS::AccountId}-${CompanyName}-${Environment}-user"
+      Tags:
+        - Key: Name
+          Value: !Sub "${AWS::AccountId}-${CompanyName}-${Environment}-user"
+        - Key: Environment
+          Value: !Sub "${AWS::AccountId}-${CompanyName}-${Environment}"
+
+  AccessKey: 
+    Type: AWS::IAM::AccessKey
+    Properties:
+      UserName: !Ref User
+
+  # IAM policy attached directly to user; policy should be attached to group or role
+  UserPolicy: 
+    Type: AWS::IAM::Policy
+    Properties:
+      PolicyName: excess_policy
+      PolicyDocument:
+        Version: 2012-10-17
+        # Policy is over-permissive
+        Statement:
+          - Effect: Allow
+            Action:
+              - "ec2:*"
+              - "s3:*"
+              - "lambda:*"
+              - "cloudwatch:*"
+            Resource: "*"
+      Users:
+        - !Ref User
+
+  #############
+  ###  KMS  ###
+  #############
+
+  LogsKey:
+    # Key does not have rotation enabled
+    Type: AWS::KMS::Key
+    Properties: 
+      Description: !Sub "${AWS::AccountId}-${CompanyName}-${Environment}-logs bucket key"
+      PendingWindowInDays: 7
+      KeyPolicy:
+        Version: '2012-10-17'
+        Id: key-default-1
+        Statement:
+        - Sid: Enable IAM User Permissions
+          Effect: Allow
+          Principal:
+            AWS: !Sub arn:aws:iam::${AWS::AccountId}:root
+          Action: kms:*
+          Resource: '*'
+
+  LogsKeyAlias:
+    Type: AWS::KMS::Alias
+    Properties:
+      AliasName: !Sub "alias/${AWS::AccountId}-${CompanyName}-${Environment}-logs-bucket-key"
+      TargetKeyId: !Ref LogsKey
+
+  ################
+  ###  Lambda  ###
+  ################
+
+  IAM4Lambda:
+    Type: "AWS::IAM::Role"
+    Properties:
+      RoleName: !Sub "${AWS::AccountId}-${CompanyName}-${Environment}-analysis-lambda"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement: 
+          -
+            Effect: "Allow"
+            Principal:
+              Service:
+                - "lambda.amazonaws.com"
+            Action:
+              - "sts:AssumeRole"
+      Path: "/"
+      Tags:
+        - Key: Name
+          Value: !Sub "${AWS::AccountId}-${CompanyName}-${Environment}-analysis-lambda"
+        - Key: Environment
+          Value: !Sub "${AWS::AccountId}-${CompanyName}-${Environment}"
+
+  AnalysisLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub "${AWS::AccountId}-${CompanyName}-${Environment}-analysis"
+      Runtime: nodejs12.x
+      Role: !GetAtt IAM4Lambda.Arn
+      Handler: exports.test
+      Code:
+        ZipFile: | 
+          console.log("Hello World");
+      Environment: 
+        Variables:
+          # Secrets Manager should be used to store private keys
+          access_key: "AKIAIOSFODNN7EXAMPLE"
+          secret_key: "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY"
+      Tags:
+        - Key: Name
+          Value: !Sub "${AWS::AccountId}-${CompanyName}-${Environment}-analysis"
+        - Key: Environment
+          Value: !Sub "${AWS::AccountId}-${CompanyName}-${Environment}"
+
+  ############
+  ###  S3  ###
+  ############
+
+  DataBucket:
+    # Public, not encrypted, no access logs, no versioning
+    Type: AWS::S3::Bucket
+    DeletionPolicy: Delete
+    Properties:
+      BucketName: !Sub "${AWS::AccountId}-${CompanyName}-${Environment}-data"
+      AccessControl: PublicRead
+      Tags:
+        - Key: Name
+          Value: !Sub "${AWS::AccountId}-${CompanyName}-${Environment}-data"
+
+  FinancialsBucket:
+    # not encrypted, no access logs, no versioning
+    Type: AWS::S3::Bucket
+    DeletionPolicy: Delete
+    Properties:
+      BucketName: !Sub "${AWS::AccountId}-${CompanyName}-${Environment}-financials"
+      AccessControl: Private
+      Tags:
+        - Key: Name
+          Value: !Sub "${AWS::AccountId}-${CompanyName}-${Environment}-financials"
+
+  DataScienceBucket:
+    # not encrypted
+    Type: AWS::S3::Bucket
+    DeletionPolicy: Delete
+    Properties:
+      BucketName: !Sub "${AWS::AccountId}-${CompanyName}-${Environment}-data-science"
+      AccessControl: Private
+      VersioningConfiguration:
+        Status: Enabled
+      LoggingConfiguration: 
+        DestinationBucketName: !Ref LogsBucket
+        LogFilePrefix: log/
+      Tags:
+        - Key: Name
+          Value: !Sub "${AWS::AccountId}-${CompanyName}-${Environment}-data-science"
+
+  LogsBucket:
+    # not encrypted
+    Type: AWS::S3::Bucket
+    DeletionPolicy: Delete
+    Properties:
+      BucketName: !Sub "${AWS::AccountId}-${CompanyName}-${Environment}-logs"
+      AccessControl: LogDeliveryWrite
+      VersioningConfiguration:
+        Status: Enabled
+      BucketEncryption: 
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              KMSMasterKeyID: !Ref LogsKey
+              SSEAlgorithm: aws:kms
+      Tags:
+        - Key: Name
+          Value: !Sub "${AWS::AccountId}-${CompanyName}-${Environment}-logs"
+
+Outputs:
+  EC2PublicDNS:
+    Description: Web Host Public DNS Name
+    Value: !GetAtt [EC2Instance, PublicDnsName]
+  VpcId:
+    Description: The ID of the VPC 
+    Value: !Ref WebVPC
+  PublicSubnet:
+    Description: The ID of the Public Subnet
+    Value: !Ref WebSubnet
+  PublicSubnet2: 
+    Description: The ID of the Public Subnet
+    Value: !Ref WebSubnet2
+
+  UserName:
+    Description: The Name of the IAM User
+    Value: !Ref User
+  # Exposes access key of user  
+  SecretKey: 
+    Description: The Secret Key of the IAM User
+    Value: !GetAtt AccessKey.SecretAccessKey
